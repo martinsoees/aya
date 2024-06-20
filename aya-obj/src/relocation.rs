@@ -541,9 +541,8 @@ fn insn_is_call(ins: &bpf_insn) -> bool {
 
 #[cfg(test)]
 mod test {
-    use std::os::fd::{AsRawFd, IntoRawFd, RawFd};
-
     use alloc::{string::ToString, vec, vec::Vec};
+    use std::os::fd::RawFd;
 
     use super::*;
     use crate::maps::{BtfMap, LegacyMap};
