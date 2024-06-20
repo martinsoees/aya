@@ -102,29 +102,67 @@ pub(crate) struct Symbol {
     pub(crate) kind: SymbolKind,
 }
 
+#[derive(Debug, Clone)]
+struct MapInformation<'a> {
+    pub(crate) maps_by_section: HashMap<usize, (&'a str, i32, &'a Map)>,
+    pub(crate) maps_by_symbol: HashMap<usize, (&'a str, i32, &'a Map)>,
+    pub(crate) ignored_by_section: HashSet<usize>,
+    pub(crate) ignored_by_symbol: HashSet<usize>,
+}
+
+impl<'a> MapInformation<'a> {
+    fn new() -> Self {
+        Self {
+            maps_by_section: HashMap::new(),
+            maps_by_symbol: HashMap::new(),
+            ignored_by_section: HashSet::new(),
+            ignored_by_symbol: HashSet::new(),
+        }
+    }
+    fn resolve_sections_and_symbols<I: Iterator<Item = (&'a str, std::os::fd::RawFd, &'a Map)>>(
+        &mut self,
+        maps: I,
+    ) -> &mut Self {
+        for (name, fd, map) in maps {
+            self.maps_by_section
+                .insert(map.section_index(), (name, fd, map));
+            if let Some(index) = map.symbol_index() {
+                self.maps_by_symbol.insert(index, (name, fd, map));
+            }
+        }
+        self
+    }
+
+    fn resolve_ignored_maps(&mut self, ignored_maps: &HashMap<String, Map>) -> &mut Self {
+        for map in ignored_maps.values() {
+            self.ignored_by_section.insert(map.section_index());
+            if let Some(index) = map.symbol_index() {
+                self.ignored_by_symbol.insert(index);
+            }
+        }
+        self
+    }
+}
+
 impl Object {
     /// Relocates the map references
     pub fn relocate_maps<'a, I: Iterator<Item = (&'a str, std::os::fd::RawFd, &'a Map)>>(
         &mut self,
         maps: I,
         text_sections: &HashSet<usize>,
+        ignored_maps: &HashMap<String, Map>,
     ) -> Result<(), EbpfRelocationError> {
-        let mut maps_by_section = HashMap::new();
-        let mut maps_by_symbol = HashMap::new();
-        for (name, fd, map) in maps {
-            maps_by_section.insert(map.section_index(), (name, fd, map));
-            if let Some(index) = map.symbol_index() {
-                maps_by_symbol.insert(index, (name, fd, map));
-            }
-        }
+        let resolved_maps = MapInformation::new()
+            .resolve_sections_and_symbols(maps)
+            .resolve_ignored_maps(ignored_maps)
+            .clone();
 
         for function in self.functions.values_mut() {
             if let Some(relocations) = self.relocations.get(&function.section_index) {
                 relocate_maps(
                     function,
                     relocations.values(),
-                    &maps_by_section,
-                    &maps_by_symbol,
+                    &resolved_maps,
                     &self.symbol_table,
                     text_sections,
                 )
@@ -179,8 +217,7 @@ impl Object {
 fn relocate_maps<'a, I: Iterator<Item = &'a Relocation>>(
     fun: &mut Function,
     relocations: I,
-    maps_by_section: &HashMap<usize, (&str, std::os::fd::RawFd, &Map)>,
-    maps_by_symbol: &HashMap<usize, (&str, std::os::fd::RawFd, &Map)>,
+    map_information: &MapInformation,
     symbol_table: &HashMap<usize, Symbol>,
     text_sections: &HashSet<usize>,
 ) -> Result<(), RelocationError> {
@@ -222,7 +259,12 @@ fn relocate_maps<'a, I: Iterator<Item = &'a Relocation>>(
             continue;
         }
 
-        let (_name, fd, map) = if let Some(m) = maps_by_symbol.get(&rel.symbol_index) {
+        let (_name, fd, map) = if map_information
+            .ignored_by_symbol
+            .contains(&rel.symbol_index)
+        {
+            continue;
+        } else if let Some(m) = map_information.maps_by_symbol.get(&rel.symbol_index) {
             let map = &m.2;
             debug!(
                 "relocating map by symbol index {:?}, kind {:?} at insn {ins_index} in section {}",
@@ -232,8 +274,10 @@ fn relocate_maps<'a, I: Iterator<Item = &'a Relocation>>(
             );
             debug_assert_eq!(map.symbol_index().unwrap(), rel.symbol_index);
             m
+        } else if map_information.ignored_by_section.contains(&section_index) {
+            continue;
         } else {
-            let Some(m) = maps_by_section.get(&section_index) else {
+            let Some(m) = map_information.maps_by_section.get(&section_index) else {
                 debug!("failed relocating map by section index {}", section_index);
                 return Err(RelocationError::SectionNotFound {
                     symbol_index: rel.symbol_index,
@@ -497,6 +541,8 @@ fn insn_is_call(ins: &bpf_insn) -> bool {
 
 #[cfg(test)]
 mod test {
+    use std::os::fd::{AsRawFd, IntoRawFd, RawFd};
+
     use alloc::{string::ToString, vec, vec::Vec};
 
     use super::*;
@@ -568,16 +614,22 @@ mod test {
             symbol_index: 1,
             size: 64,
         }];
-        let maps_by_section = HashMap::new();
 
-        let map = fake_legacy_map(1);
-        let maps_by_symbol = HashMap::from([(1, ("test_map", 1, &map))]);
+        let maps: HashMap<String, Map> =
+            HashMap::from([("test_map".to_string(), fake_legacy_map(1))]);
+
+        let map_information = MapInformation::new()
+            .resolve_sections_and_symbols(
+                maps.iter()
+                    .map(|(s, d)| (s.as_str(), d.symbol_index().unwrap() as RawFd, d)),
+            )
+            .resolve_ignored_maps(&HashMap::new())
+            .clone();
 
         relocate_maps(
             &mut fun,
             relocations.iter(),
-            &maps_by_section,
-            &maps_by_symbol,
+            &map_information,
             &symbol_table,
             &HashSet::new(),
         )
@@ -620,20 +672,23 @@ mod test {
                 size: 64,
             },
         ];
-        let maps_by_section = HashMap::new();
-
-        let map_1 = fake_legacy_map(1);
-        let map_2 = fake_legacy_map(2);
-        let maps_by_symbol = HashMap::from([
-            (1, ("test_map_1", 1, &map_1)),
-            (2, ("test_map_2", 2, &map_2)),
+        let maps: HashMap<String, Map> = HashMap::from([
+            ("test_map_1".to_string(), fake_legacy_map(1)),
+            ("test_map_2".to_string(), fake_legacy_map(2)),
         ]);
+
+        let map_information = MapInformation::new()
+            .resolve_sections_and_symbols(
+                maps.iter()
+                    .map(|(s, d)| (s.as_str(), d.symbol_index().unwrap() as RawFd, d)),
+            )
+            .resolve_ignored_maps(&HashMap::new())
+            .clone();
 
         relocate_maps(
             &mut fun,
             relocations.iter(),
-            &maps_by_section,
-            &maps_by_symbol,
+            &map_information,
             &symbol_table,
             &HashSet::new(),
         )
@@ -663,16 +718,21 @@ mod test {
             symbol_index: 1,
             size: 64,
         }];
-        let maps_by_section = HashMap::new();
 
-        let map = fake_btf_map(1);
-        let maps_by_symbol = HashMap::from([(1, ("test_map", 1, &map))]);
+        let maps: HashMap<String, Map> = HashMap::from([("test_map".to_string(), fake_btf_map(1))]);
+
+        let map_information = MapInformation::new()
+            .resolve_sections_and_symbols(
+                maps.iter()
+                    .map(|(s, d)| (s.as_str(), d.symbol_index().unwrap() as RawFd, d)),
+            )
+            .resolve_ignored_maps(&HashMap::new())
+            .clone();
 
         relocate_maps(
             &mut fun,
             relocations.iter(),
-            &maps_by_section,
-            &maps_by_symbol,
+            &map_information,
             &symbol_table,
             &HashSet::new(),
         )
@@ -715,20 +775,24 @@ mod test {
                 size: 64,
             },
         ];
-        let maps_by_section = HashMap::new();
 
-        let map_1 = fake_btf_map(1);
-        let map_2 = fake_btf_map(2);
-        let maps_by_symbol = HashMap::from([
-            (1, ("test_map_1", 1, &map_1)),
-            (2, ("test_map_2", 2, &map_2)),
+        let maps: HashMap<String, Map> = HashMap::from([
+            ("test_map_1".to_string(), fake_btf_map(1)),
+            ("test_map_2".to_string(), fake_btf_map(2)),
         ]);
+
+        let map_information = MapInformation::new()
+            .resolve_sections_and_symbols(
+                maps.iter()
+                    .map(|(s, d)| (s.as_str(), d.symbol_index().unwrap() as RawFd, d)),
+            )
+            .resolve_ignored_maps(&HashMap::new())
+            .clone();
 
         relocate_maps(
             &mut fun,
             relocations.iter(),
-            &maps_by_section,
-            &maps_by_symbol,
+            &map_information,
             &symbol_table,
             &HashSet::new(),
         )
